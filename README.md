@@ -29,6 +29,7 @@ cp .env.example .env
 The expected reports are:
 
 ```text
+reports/generated/validation-evidence.md
 reports/generated/validation-events.csv
 reports/generated/validation-summary.json
 reports/generated/validation-summary.md
