@@ -1,0 +1,10 @@
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+SET ECHO ON
+
+CONNECT semcache_app/"SemCache_26ai_Demo"@//localhost:1521/FREEPDB1
+
+DELETE FROM sem_cache_event WHERE 1 = 1;
+DELETE FROM sem_cache_entry WHERE 1 = 1;
+COMMIT;
+
+EXIT

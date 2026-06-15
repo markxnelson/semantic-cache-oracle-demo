@@ -1,0 +1,59 @@
+services:
+  oracle-db:
+    image: ${ORACLE_IMAGE:-container-registry.oracle.com/database/free}:${ORACLE_IMAGE_TAG:-23.26.2.0}
+    container_name: semantic-cache-oracle-db
+    ports:
+      - "${PRIMARY_HOST_PORT:-15210}:1521"
+    environment:
+      ORACLE_PWD: ${ORACLE_PWD:-Oracle_26ai_Demo_2026}
+      ENABLE_ARCHIVELOG: "true"
+      ENABLE_FORCE_LOGGING: "true"
+    volumes:
+      - oracle-db-data:/opt/oracle/oradata
+      - ./db/init:/opt/oracle/scripts/startup
+    networks:
+      semcache-net:
+        ipv4_address: 172.28.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'select 1 from dual;' | sqlplus -s system/$${ORACLE_PWD}@//localhost:1521/FREEPDB1 | grep -q 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  true-cache:
+    image: ${ORACLE_IMAGE:-container-registry.oracle.com/database/free}:${ORACLE_IMAGE_TAG:-23.26.2.0}
+    container_name: semantic-cache-true-cache
+    ports:
+      - "${TRUE_CACHE_HOST_PORT:-15220}:1521"
+    depends_on:
+      oracle-db:
+        condition: service_healthy
+    environment:
+      ORACLE_PWD: ${ORACLE_PWD:-Oracle_26ai_Demo_2026}
+      TRUE_CACHE: "true"
+      PRIMARY_DB_CONN_STR: 172.28.0.10:1521/FREE
+      PRIMARY_DB_PWD_FILE: /var/tmp/orapwFREE
+    volumes:
+      - true-cache-data:/opt/oracle/oradata
+      - ./db/orapwFREE:/var/tmp/orapwFREE:ro
+    networks:
+      semcache-net:
+        ipv4_address: 172.28.0.11
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'select 1 from dual;' | sqlplus -s system/$${ORACLE_PWD}@//localhost:1521/FREEPDB1 | grep -q 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+volumes:
+  oracle-db-data:
+  true-cache-data:
+
+networks:
+  semcache-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

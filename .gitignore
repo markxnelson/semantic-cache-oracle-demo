@@ -1,0 +1,11 @@
+.env
+*.log
+
+target/
+reports/generated/
+
+db/orapwFREE
+
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,14 @@
+{
+  "workload": "ecommerce-returns-validation",
+  "embedding_dimensions": 4,
+  "scenarios": [
+    "seed-miss",
+    "exact-hit",
+    "semantic-hit",
+    "near-miss",
+    "tenant-isolation",
+    "model-mismatch",
+    "source-fingerprint-mismatch",
+    "expired-entry"
+  ]
+}
