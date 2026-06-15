@@ -78,6 +78,20 @@ for route, values in sorted(by_route.items()):
 
 lines.extend([
     "",
+    "## Route by Scenario",
+    "",
+    "| Scenario | Decision | Route | Provider calls | Distance |",
+    "| --- | --- | --- | ---: | ---: |",
+])
+for row in rows:
+    distance = row["distance"] if row["distance"] else "n/a"
+    lines.append(
+        f"| `{row['scenario']}` | `{row['decision']}` | `{row['route']}` | "
+        f"{row['provider_calls']} | {distance} |"
+    )
+
+lines.extend([
+    "",
     "## Modes Represented",
     "",
     "- no reusable cache entry on the seed miss",
@@ -93,6 +107,31 @@ lines.extend([
 ])
 
 summary_path.write_text("\n".join(lines) + "\n")
+
+print("== Benchmark lite summary ==")
+print("This lite report reuses the deterministic validation workload to confirm measurement wiring. It is not a production performance benchmark.")
+print(f"Scenarios: {len(rows)}")
+print("Provider mode: deterministic mock")
+print("Embedding mode: deterministic fixture vectors")
+print("Decision counts:")
+for decision, count in sorted(by_decision.items()):
+    print(f"- {decision}: {count}")
+print(f"Provider calls made: {provider_calls}")
+print(f"Provider calls avoided by approved reuse: {avoided}")
+print(f"Cache hit rate for approved exact or semantic reuse: {hit_rate:.2%}")
+print("Latency by route:")
+for route, values in sorted(by_route.items()):
+    print(f"- {route}: samples={len(values)} p50_ms={percentile(values, 50)} p95_ms={percentile(values, 95)}")
+print("Route by scenario:")
+for row in rows:
+    distance = row["distance"] if row["distance"] else "n/a"
+    print(
+        f"- {row['scenario']}: decision={row['decision']} route={row['route']} "
+        f"provider_calls={row['provider_calls']} distance={distance}"
+    )
+print("Generated reports:")
+print("- reports/generated/benchmark-lite-events.csv")
+print("- reports/generated/benchmark-lite-summary.md")
 PY
 
 echo "Wrote reports/generated/benchmark-lite-events.csv"

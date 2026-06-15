@@ -12,9 +12,18 @@ set -a
 source .env
 set +a
 
+echo "== Semantic cache validation wrapper =="
+echo "This validates Oracle primary plus True Cache readiness, then runs deterministic semantic-cache scenarios."
+echo "The Java app prints scenario-level decision, route, provider calls, distance, and threshold details."
+echo "Generated reports are written under reports/generated/."
+echo
+
+echo "Checking primary database and registered True Cache application login readiness..."
 ./scripts/wait-for-oracle.sh
+echo "Building the Spring Boot validation app..."
 ./mvnw -q -pl app -am package -DskipTests
-java -jar app/target/semantic-cache-oracle-app-0.1.0-SNAPSHOT.jar
+echo "Running deterministic semantic-cache scenarios..."
+env -u DEBUG java -jar app/target/semantic-cache-oracle-app-0.1.0-SNAPSHOT.jar
 
 primary_system_sql() {
   docker exec -i semantic-cache-oracle-db bash -lc "sqlplus -s system/'${ORACLE_PWD}'@//localhost:1521/FREE" <<SQL
@@ -48,6 +57,7 @@ exit
 SQL
 }
 
+echo "Writing database-boundary evidence for the primary and True Cache services..."
 evidence_file="reports/generated/validation-evidence.md"
 {
   echo "# Validation Evidence"
@@ -103,5 +113,9 @@ evidence_file="reports/generated/validation-evidence.md"
 } > "$evidence_file"
 
 echo
-echo "Validation artifacts:"
+echo "Validation summary reports:"
+echo "- reports/generated/validation-events.csv - per-scenario decisions, routes, distances, thresholds, provider calls, and latency fields"
+echo "- reports/generated/validation-summary.json - machine-readable validation summary"
+echo "- reports/generated/validation-summary.md - reader-readable scenario summary"
+echo "- reports/generated/validation-evidence.md - primary and True Cache database-boundary evidence"
 ls -1 reports/generated/validation-events.csv reports/generated/validation-summary.json reports/generated/validation-summary.md "$evidence_file"
