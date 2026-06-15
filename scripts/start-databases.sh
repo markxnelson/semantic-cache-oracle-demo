@@ -41,7 +41,11 @@ docker exec --user root semantic-cache-true-cache bash -lc 'cp /var/tmp/orapwFRE
 
 true_cache_service_exists() {
   local service_name="$1"
-  docker exec semantic-cache-oracle-db bash -lc "/opt/oracle/product/26ai/dbhomeFree/bin/lsnrctl services | grep -q 'Service \"${service_name}\"'"
+  docker exec semantic-cache-oracle-db bash -lc "printf '%s\n' \
+    'set heading off feedback off pagesize 0 verify off' \
+    \"select name from v\\\$services where upper(name) = upper('${service_name}');\" \
+    'exit' | sqlplus -s system/'${ORACLE_PWD}'@//localhost:1521/FREE | grep -qi '${service_name}'" \
+    || docker exec semantic-cache-oracle-db bash -lc "/opt/oracle/product/26ai/dbhomeFree/bin/lsnrctl services | grep -q 'Service \"${service_name}\"'"
 }
 
 configure_true_cache_service() {
@@ -60,7 +64,20 @@ configure_true_cache_service() {
     pdb_arg="-pdbName ${pdb_name}"
   fi
 
-  docker exec semantic-cache-oracle-db bash -lc "/opt/oracle/product/26ai/dbhomeFree/bin/dbca -configureDatabase -configureTrueCacheInstanceService -sourceDB FREE -trueCacheConnectString ${true_cache_connect_string} -trueCacheServiceName ${service_name} -serviceName ${source_service_name} ${pdb_arg} -sysPassword '${ORACLE_PWD}' -silent"
+  local output
+  set +e
+  output=$(docker exec semantic-cache-oracle-db bash -lc "/opt/oracle/product/26ai/dbhomeFree/bin/dbca -configureDatabase -configureTrueCacheInstanceService -sourceDB FREE -trueCacheConnectString ${true_cache_connect_string} -trueCacheServiceName ${service_name} -serviceName ${source_service_name} ${pdb_arg} -sysPassword '${ORACLE_PWD}' -silent" 2>&1)
+  local status=$?
+  set -e
+
+  printf '%s\n' "$output"
+  if [[ "$status" -ne 0 ]]; then
+    if grep -q "DBT-19958" <<< "$output" && grep -q "${service_name}" <<< "$output"; then
+      echo "True Cache service ${service_name} already exists according to DBCA; continuing."
+      return
+    fi
+    return "$status"
+  fi
 }
 
 echo "Configuring True Cache services from the primary database..."
