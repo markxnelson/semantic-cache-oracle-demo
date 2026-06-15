@@ -65,7 +65,7 @@ evidence_file="reports/generated/validation-evidence.md"
   echo "Primary database logging mode:"
   echo
   echo '```text'
-  primary_system_sql "select log_mode, force_logging from v\\\$database;"
+  primary_system_sql 'select log_mode, force_logging from v$database;'
   echo '```'
   echo
   echo "Primary schema objects:"
@@ -79,7 +79,7 @@ evidence_file="reports/generated/validation-evidence.md"
   echo "True Cache database mode:"
   echo
   echo '```text'
-  true_cache_system_sql "select open_mode, database_role from v\\\$database;"
+  true_cache_system_sql 'select open_mode, database_role from v$database;'
   echo '```'
   echo
   echo "Application schema through the registered True Cache service:"
