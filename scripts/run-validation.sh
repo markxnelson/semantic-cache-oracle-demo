@@ -12,6 +12,7 @@ set -a
 source .env
 set +a
 
+./scripts/wait-for-oracle.sh
 ./mvnw -q -pl app -am package -DskipTests
 java -jar app/target/semantic-cache-oracle-app-0.1.0-SNAPSHOT.jar
 

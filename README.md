@@ -26,6 +26,8 @@ cp .env.example .env
 ./scripts/run-benchmark-lite.sh
 ```
 
+`run-validation.sh` runs the readiness check before starting the Java application. If that check cannot see the `semcache_pdb_tc` True Cache service, rerun `./scripts/start-databases.sh` and then run validation again.
+
 The expected reports are:
 
 ```text
