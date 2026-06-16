@@ -47,13 +47,18 @@ For a larger benchmark that compares cache modes, run:
 
 ```bash
 BENCHMARK_REQUESTS=1000 \
+BENCHMARK_WORKLOAD_FAMILIES=50 \
 BENCHMARK_CONCURRENCY=1 \
-BENCHMARK_PROVIDER_LATENCY_MS=10 \
+BENCHMARK_PROVIDER_MODE=openai \
 BENCHMARK_PREWARM_PAUSE_MS=1500 \
 ./scripts/run-benchmark-full.sh
 ```
 
-The full benchmark uses deterministic provider mode by default. It compares:
+The full benchmark uses real OpenAI calls by default. Set `OPENAI_API_KEY` before running it, and optionally set `OPENAI_CHAT_MODEL`, `OPENAI_INPUT_COST_PER_MILLION`, and `OPENAI_OUTPUT_COST_PER_MILLION` to match the model and pricing assumptions you want reported.
+
+For a quick wiring smoke test that does not call OpenAI, run the same script with `BENCHMARK_PROVIDER_MODE=deterministic`. Do not use deterministic-mode latency charts as performance evidence.
+
+The full benchmark compares:
 
 - `no-cache`
 - `exact-cache`
@@ -76,11 +81,11 @@ reports/generated/benchmark-full-provider-calls.png
 reports/generated/benchmark-full-cost.png
 ```
 
-The estimated cost values use deterministic token estimates and configurable example prices in the demo code. Treat them as a repeatable benchmark signal, not as a provider invoice.
+In OpenAI mode, token counts come from the OpenAI Responses API usage fields and cost values are calculated from those reported tokens and the configured per-million-token prices. Treat the cost as a benchmark estimate unless the configured prices match the model pricing you intend to use.
 
 The default concurrency is `1` because the local Oracle True Cache Free container can reject bursts of concurrent listener connections on small developer machines. Raise `BENCHMARK_CONCURRENCY` deliberately when you want to study concurrency on a machine and container configuration sized for it.
 
-The prewarm pause gives Oracle True Cache a short window to see seeded cache rows before measured read-route requests begin. Keep it visible in benchmark reports because it is part of the test method.
+Before each measured cache mode, the harness seeds one cache entry per workload family, waits for the configured prewarm pause, and then starts the measured request set. The prewarm count and workload-family count are written to `benchmark-full-config.json` and `benchmark-full-summary.md` because they are part of the test method.
 
 ## Routes
 

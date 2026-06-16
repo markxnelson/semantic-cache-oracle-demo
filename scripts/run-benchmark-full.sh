@@ -13,8 +13,9 @@ source .env
 set +a
 
 export BENCHMARK_REQUESTS="${BENCHMARK_REQUESTS:-1000}"
+export BENCHMARK_WORKLOAD_FAMILIES="${BENCHMARK_WORKLOAD_FAMILIES:-50}"
 export BENCHMARK_CONCURRENCY="${BENCHMARK_CONCURRENCY:-1}"
-export BENCHMARK_PROVIDER_MODE="${BENCHMARK_PROVIDER_MODE:-deterministic}"
+export BENCHMARK_PROVIDER_MODE="${BENCHMARK_PROVIDER_MODE:-openai}"
 export BENCHMARK_PROVIDER_LATENCY_MS="${BENCHMARK_PROVIDER_LATENCY_MS:-10}"
 export BENCHMARK_PREWARM_PAUSE_MS="${BENCHMARK_PREWARM_PAUSE_MS:-1500}"
 export BENCHMARK_SEED="${BENCHMARK_SEED:-260612}"
@@ -22,9 +23,14 @@ export BENCHMARK_SEED="${BENCHMARK_SEED:-260612}"
 echo "== Full semantic cache benchmark wrapper =="
 echo "This benchmark compares no-cache, exact-cache, semantic-cache-primary, semantic-cache-true-cache, and semantic-cache-write-through modes."
 echo "Requests per mode: ${BENCHMARK_REQUESTS}"
+echo "Workload families: ${BENCHMARK_WORKLOAD_FAMILIES}"
 echo "Concurrency: ${BENCHMARK_CONCURRENCY}"
 echo "Provider mode: ${BENCHMARK_PROVIDER_MODE}"
-echo "Provider latency simulation: ${BENCHMARK_PROVIDER_LATENCY_MS} ms"
+if [[ "${BENCHMARK_PROVIDER_MODE}" == "deterministic" ]]; then
+  echo "Provider latency simulation: ${BENCHMARK_PROVIDER_LATENCY_MS} ms"
+else
+  echo "OpenAI model: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
+fi
 echo "Prewarm visibility pause: ${BENCHMARK_PREWARM_PAUSE_MS} ms"
 echo
 
@@ -70,7 +76,7 @@ def save_bar(path, title, ylabel, labels, values, color, value_format=None):
 modes = [row["mode"] for row in latency_rows]
 save_bar(
     "benchmark-full-wall-clock.png",
-    "Wall-clock time by benchmark mode",
+    "Wall-clock time by benchmark mode (lower is better)",
     "Wall-clock milliseconds",
     modes,
     [int(row["wall_clock_ms"]) for row in latency_rows],
@@ -79,7 +85,7 @@ save_bar(
 )
 save_bar(
     "benchmark-full-requests-per-second.png",
-    "Throughput by benchmark mode",
+    "Throughput by benchmark mode (higher is better)",
     "Requests per second",
     modes,
     [float(row["requests_per_second"]) for row in latency_rows],
@@ -90,7 +96,7 @@ save_bar(
 cost_by_mode = {row["mode"]: row for row in cost_rows}
 save_bar(
     "benchmark-full-provider-calls.png",
-    "Provider calls made by benchmark mode",
+    "Provider calls made by benchmark mode (lower is better)",
     "Provider calls",
     modes,
     [int(cost_by_mode[mode]["provider_calls_made"]) for mode in modes],
@@ -99,7 +105,7 @@ save_bar(
 )
 save_bar(
     "benchmark-full-cost.png",
-    "Estimated provider cost by benchmark mode",
+    "Estimated provider cost by benchmark mode (lower is better)",
     "Estimated USD",
     modes,
     [float(cost_by_mode[mode]["estimated_cost_usd"]) for mode in modes],

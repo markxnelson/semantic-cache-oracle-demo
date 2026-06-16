@@ -1,5 +1,8 @@
 package com.example.semcache.app;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.example.semcache.oracle.AnswerProvider;
 import com.example.semcache.oracle.SemanticCacheRequest;
 import com.example.semcache.oracle.SemanticCacheResponse;
@@ -8,12 +11,17 @@ import oracle.jdbc.pool.OracleDataSource;
 
 import javax.sql.DataSource;
 import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -21,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -32,37 +41,40 @@ final class FullBenchmarkRunner {
     private static final double THRESHOLD = 0.10;
     private static final double INPUT_COST_PER_MILLION = 0.15;
     private static final double OUTPUT_COST_PER_MILLION = 0.60;
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private FullBenchmarkRunner() {
     }
 
     static void run() throws Exception {
         BenchmarkConfig config = BenchmarkConfig.fromEnvironment();
-        if (!config.providerMode().equals("deterministic")) {
-            throw new IllegalArgumentException("Only BENCHMARK_PROVIDER_MODE=deterministic is implemented in this demo. Live provider mode is intentionally deferred until token usage can be captured from the selected provider API.");
-        }
 
         DataSource primary = oracleDataSource(config.primaryJdbcUrl(), config.user(), config.password());
         DataSource trueCache = oracleDataSource(config.trueCacheJdbcUrl(), config.user(), config.password());
-        List<WorkloadItem> workload = WorkloadItem.generate(config.requests());
-        BenchmarkProvider provider = new BenchmarkProvider(config.providerLatencyMs());
+        List<WorkloadItem> workload = WorkloadItem.generate(config.requests(), config.workloadFamilies());
+        BenchmarkAnswerProvider provider = BenchmarkAnswerProvider.create(config);
         List<BenchmarkEvent> allEvents = new ArrayList<>();
         List<ModeSummary> summaries = new ArrayList<>();
 
         System.out.println();
         System.out.println("== Full semantic cache benchmark ==");
         System.out.println("Requests per measured mode: " + config.requests());
+        System.out.println("Workload families: " + config.workloadFamilies());
         System.out.println("Concurrency: " + config.concurrency());
-        System.out.println("Provider mode: deterministic mock");
-        System.out.println("Provider latency simulation: " + config.providerLatencyMs() + " ms per provider call");
+        System.out.println("Provider mode: " + provider.displayName());
+        if (config.providerMode().equals("deterministic")) {
+            System.out.println("Provider latency simulation: " + config.providerLatencyMs() + " ms per provider call");
+            System.out.println("Use BENCHMARK_PROVIDER_MODE=openai for live provider measurements.");
+        }
         System.out.println("Prewarm visibility pause: " + config.prewarmPauseMs() + " ms");
+        System.out.println("Prewarm cache entries per measured cache mode: " + (config.workloadFamilies() + 1));
         System.out.println("Output: reports/generated/benchmark-full-*");
 
         summaries.add(runNoCacheMode(config, provider, workload, allEvents));
         summaries.add(runCacheMode(config, "exact-cache", primary, trueCache, "true-cache", provider, workload, allEvents, true, -1.0));
         summaries.add(runCacheMode(config, "semantic-cache-primary", primary, primary, "primary", provider, workload, allEvents, true, THRESHOLD));
         summaries.add(runCacheMode(config, "semantic-cache-true-cache", primary, trueCache, "true-cache", provider, workload, allEvents, true, THRESHOLD));
-        summaries.add(runCacheMode(config, "semantic-cache-write-through", primary, trueCache, "true-cache", provider, WorkloadItem.generateColdMissOnly(config.requests()), allEvents, false, THRESHOLD));
+        summaries.add(runCacheMode(config, "semantic-cache-write-through", primary, trueCache, "true-cache", provider, WorkloadItem.generateColdMissOnly(config.requests(), config.workloadFamilies()), allEvents, false, THRESHOLD));
 
         DatabaseEvidence evidence = DatabaseEvidence.collect(primary, trueCache);
         writeReports(config, summaries, allEvents, evidence);
@@ -71,14 +83,15 @@ final class FullBenchmarkRunner {
 
     private static ModeSummary runNoCacheMode(
             BenchmarkConfig config,
-            BenchmarkProvider provider,
+            BenchmarkAnswerProvider provider,
             List<WorkloadItem> workload,
             List<BenchmarkEvent> allEvents) throws Exception {
         long started = System.nanoTime();
         List<BenchmarkEvent> events = runConcurrent(config, "no-cache", workload, item -> {
             long requestStarted = System.nanoTime();
-            String answer = provider.generate(item.request("no-cache", THRESHOLD));
-            TokenUsage tokenUsage = TokenUsage.from(item.prompt(), answer, true);
+            SemanticCacheRequest request = item.request("no-cache", THRESHOLD);
+            String answer = provider.generate(request);
+            TokenUsage tokenUsage = TokenUsage.from(item.prompt(), answer, true, provider.metrics(request.scenarioName()));
             return new BenchmarkEvent(
                 "no-cache",
                 item.index(),
@@ -92,7 +105,8 @@ final class FullBenchmarkRunner {
                 tokenUsage.promptTokens(),
                 tokenUsage.completionTokens(),
                 tokenUsage.totalTokens(),
-                tokenUsage.estimatedCostUsd());
+                tokenUsage.estimatedCostUsd(),
+                tokenUsage.source());
         });
         long wallClockMs = elapsedMillis(started);
         allEvents.addAll(events);
@@ -105,7 +119,7 @@ final class FullBenchmarkRunner {
             DataSource primary,
             DataSource read,
             String routeName,
-            BenchmarkProvider provider,
+            BenchmarkAnswerProvider provider,
             List<WorkloadItem> workload,
             List<BenchmarkEvent> allEvents,
             boolean prewarm,
@@ -115,33 +129,34 @@ final class FullBenchmarkRunner {
                 SemanticCacheService setupCache = new SemanticCacheService(primaryConnection, primaryConnection, "primary", provider);
                 setupCache.reset();
                 if (prewarm) {
-                    prewarm(setupCache, threshold);
+                    prewarm(setupCache, threshold, config.workloadFamilies());
                     if (config.prewarmPauseMs() > 0) {
                         Thread.sleep(config.prewarmPauseMs());
                     }
                 }
                 try (Connection readConnection = read.getConnection()) {
                     SemanticCacheService cache = new SemanticCacheService(primaryConnection, readConnection, routeName, provider);
-                    return runPreparedCacheMode(config, mode, cache, workload, allEvents, threshold);
+                    return runPreparedCacheMode(config, mode, cache, provider, workload, allEvents, threshold);
                 }
             }
         }
 
         SemanticCacheService cache = new SemanticCacheService(primary, read, routeName, provider);
-        return runCacheModeWithService(config, mode, cache, workload, allEvents, prewarm, threshold);
+        return runCacheModeWithService(config, mode, cache, provider, workload, allEvents, prewarm, threshold);
     }
 
     private static ModeSummary runCacheModeWithService(
             BenchmarkConfig config,
             String mode,
             SemanticCacheService cache,
+            BenchmarkAnswerProvider provider,
             List<WorkloadItem> workload,
             List<BenchmarkEvent> allEvents,
             boolean prewarm,
             double threshold) throws Exception {
         cache.reset();
         if (prewarm) {
-            prewarm(cache, threshold);
+            prewarm(cache, threshold, config.workloadFamilies());
             if (config.prewarmPauseMs() > 0) {
                 Thread.sleep(config.prewarmPauseMs());
             }
@@ -150,7 +165,7 @@ final class FullBenchmarkRunner {
         long started = System.nanoTime();
         List<BenchmarkEvent> events = runConcurrent(config, mode, workload, item -> {
             SemanticCacheResponse response = cache.answer(item.request(mode, threshold));
-            TokenUsage tokenUsage = TokenUsage.from(item.prompt(), response.answer(), response.providerCalls() > 0);
+            TokenUsage tokenUsage = TokenUsage.from(item.prompt(), response.answer(), response.providerCalls() > 0, provider.metrics(response.scenarioName()));
             return BenchmarkEvent.from(mode, item, response, tokenUsage);
         });
         long wallClockMs = elapsedMillis(started);
@@ -162,13 +177,14 @@ final class FullBenchmarkRunner {
             BenchmarkConfig config,
             String mode,
             SemanticCacheService cache,
+            BenchmarkAnswerProvider provider,
             List<WorkloadItem> workload,
             List<BenchmarkEvent> allEvents,
             double threshold) throws Exception {
         long started = System.nanoTime();
         List<BenchmarkEvent> events = runConcurrent(config, mode, workload, item -> {
             SemanticCacheResponse response = cache.answer(item.request(mode, threshold));
-            TokenUsage tokenUsage = TokenUsage.from(item.prompt(), response.answer(), response.providerCalls() > 0);
+            TokenUsage tokenUsage = TokenUsage.from(item.prompt(), response.answer(), response.providerCalls() > 0, provider.metrics(response.scenarioName()));
             return BenchmarkEvent.from(mode, item, response, tokenUsage);
         });
         long wallClockMs = elapsedMillis(started);
@@ -199,9 +215,10 @@ final class FullBenchmarkRunner {
         }
     }
 
-    private static void prewarm(SemanticCacheService cache, double threshold) throws SQLException {
-        cache.answer(WorkloadItem.seedExact().request("prewarm-exact", threshold));
-        cache.answer(WorkloadItem.seedSemantic().request("prewarm-semantic", threshold));
+    private static void prewarm(SemanticCacheService cache, double threshold, int workloadFamilies) throws SQLException {
+        for (WorkloadFamily family : WorkloadFamily.generate(workloadFamilies)) {
+            cache.answer(family.seedItem().request("prewarm-family", threshold));
+        }
         cache.seedExpiredEntry(
             new SemanticCacheRequest(
                 "prewarm-expired",
@@ -238,11 +255,16 @@ final class FullBenchmarkRunner {
             {
               "generated_at": "%s",
               "requests_per_mode": %d,
+              "workload_families": %d,
+              "prewarm_entries_per_cache_mode": %d,
               "concurrency": %d,
               "provider_mode": "%s",
+              "openai_model": "%s",
               "provider_latency_ms": %d,
               "prewarm_pause_ms": %d,
               "benchmark_seed": %d,
+              "input_cost_per_million": %s,
+              "output_cost_per_million": %s,
               "primary_jdbc_url": "%s",
               "true_cache_jdbc_url": "%s",
               "java_version": "%s",
@@ -251,11 +273,16 @@ final class FullBenchmarkRunner {
             """.formatted(
             Instant.now(),
             config.requests(),
+            config.workloadFamilies(),
+            config.workloadFamilies() + 1,
             config.concurrency(),
             config.providerMode(),
+            escape(config.openAiModel()),
             config.providerLatencyMs(),
             config.prewarmPauseMs(),
             config.seed(),
+            formatDouble(config.inputCostPerMillion()),
+            formatDouble(config.outputCostPerMillion()),
             escape(config.primaryJdbcUrl()),
             escape(config.trueCacheJdbcUrl()),
             escape(System.getProperty("java.version")),
@@ -265,7 +292,7 @@ final class FullBenchmarkRunner {
     }
 
     private static void writeEvents(Path output, List<BenchmarkEvent> events) throws IOException {
-        StringBuilder csv = new StringBuilder("mode,request_index,workload_type,decision,route,provider_calls,latency_ms,distance,threshold,prompt_tokens,completion_tokens,total_tokens,estimated_cost_usd\n");
+        StringBuilder csv = new StringBuilder("mode,request_index,workload_type,decision,route,provider_calls,latency_ms,distance,threshold,prompt_tokens,completion_tokens,total_tokens,estimated_cost_usd,token_source\n");
         for (BenchmarkEvent event : events) {
             csv.append(event.mode()).append(',')
                 .append(event.requestIndex()).append(',')
@@ -279,7 +306,8 @@ final class FullBenchmarkRunner {
                 .append(event.promptTokens()).append(',')
                 .append(event.completionTokens()).append(',')
                 .append(event.totalTokens()).append(',')
-                .append(formatMoney(event.estimatedCostUsd())).append('\n');
+                .append(formatMoney(event.estimatedCostUsd())).append(',')
+                .append(event.tokenSource()).append('\n');
         }
         Files.writeString(output.resolve("benchmark-full-events.csv"), csv.toString());
     }
@@ -329,12 +357,21 @@ final class FullBenchmarkRunner {
             DatabaseEvidence evidence) throws IOException {
         StringBuilder md = new StringBuilder();
         md.append("# Benchmark Full Summary\n\n");
-        md.append("This report measures a deterministic semantic-cache workload across cache modes. It is suitable for comparing this local workload, not for universal production claims.\n\n");
+        md.append("This report measures a semantic-cache workload across cache modes. It is suitable for comparing this local workload, not for universal production claims.\n\n");
         md.append("## Configuration\n\n");
         md.append("- Requests per mode: `").append(config.requests()).append("`\n");
+        md.append("- Workload families: `").append(config.workloadFamilies()).append("`\n");
+        md.append("- Prewarm entries per measured cache mode: `").append(config.workloadFamilies() + 1).append("`\n");
         md.append("- Concurrency: `").append(config.concurrency()).append("`\n");
         md.append("- Provider mode: `").append(config.providerMode()).append("`\n");
-        md.append("- Provider latency simulation: `").append(config.providerLatencyMs()).append(" ms`\n");
+        if (config.providerMode().equals("deterministic")) {
+            md.append("- Provider latency simulation: `").append(config.providerLatencyMs()).append(" ms`\n");
+        } else {
+            md.append("- OpenAI model: `").append(config.openAiModel()).append("`\n");
+            md.append("- Token source: provider-reported usage from OpenAI Responses API\n");
+        }
+        md.append("- Input cost per million tokens: `").append(formatDouble(config.inputCostPerMillion())).append("`\n");
+        md.append("- Output cost per million tokens: `").append(formatDouble(config.outputCostPerMillion())).append("`\n");
         md.append("- Prewarm visibility pause: `").append(config.prewarmPauseMs()).append(" ms`\n");
         md.append("- Benchmark seed: `").append(config.seed()).append("`\n\n");
 
@@ -437,23 +474,38 @@ final class FullBenchmarkRunner {
             String primaryJdbcUrl,
             String trueCacheJdbcUrl,
             int requests,
+            int workloadFamilies,
             int concurrency,
             int providerLatencyMs,
             int prewarmPauseMs,
             long seed,
-            String providerMode) {
+            String providerMode,
+            String openAiApiKey,
+            String openAiModel,
+            String openAiBaseUrl,
+            int openAiMaxOutputTokens,
+            double inputCostPerMillion,
+            double outputCostPerMillion) {
         static BenchmarkConfig fromEnvironment() {
+            String providerMode = env("BENCHMARK_PROVIDER_MODE", "deterministic");
             return new BenchmarkConfig(
                 env("APP_USER", "SEMCACHE_APP"),
                 env("APP_PASSWORD", "SemCache_26ai_Demo"),
                 env("PRIMARY_JDBC_URL", "jdbc:oracle:thin:@//localhost:1521/FREEPDB1"),
                 env("TRUE_CACHE_JDBC_URL", env("PRIMARY_JDBC_URL", "jdbc:oracle:thin:@//localhost:1521/FREEPDB1")),
                 positiveInt("BENCHMARK_REQUESTS", 1000),
+                positiveInt("BENCHMARK_WORKLOAD_FAMILIES", 50),
                 positiveInt("BENCHMARK_CONCURRENCY", 1),
                 positiveInt("BENCHMARK_PROVIDER_LATENCY_MS", 10),
                 nonNegativeInt("BENCHMARK_PREWARM_PAUSE_MS", 1500),
                 Long.parseLong(env("BENCHMARK_SEED", "260612")),
-                env("BENCHMARK_PROVIDER_MODE", "deterministic"));
+                providerMode,
+                env("OPENAI_API_KEY", ""),
+                env("OPENAI_CHAT_MODEL", CHAT_MODEL),
+                env("OPENAI_BASE_URL", "https://api.openai.com/v1/responses"),
+                positiveInt("OPENAI_MAX_OUTPUT_TOKENS", 80),
+                doubleValue("OPENAI_INPUT_COST_PER_MILLION", INPUT_COST_PER_MILLION),
+                doubleValue("OPENAI_OUTPUT_COST_PER_MILLION", OUTPUT_COST_PER_MILLION));
         }
 
         private static int positiveInt(String name, int fallback) {
@@ -476,44 +528,44 @@ final class FullBenchmarkRunner {
             String value = System.getenv(name);
             return value == null || value.isBlank() ? fallback : value;
         }
+
+        private static double doubleValue(String name, double fallback) {
+            return Double.parseDouble(env(name, Double.toString(fallback)));
+        }
     }
 
     private record WorkloadItem(int index, String type, String tenant, String prompt, String chatModel, String embeddingModel, String sourceFingerprint, double[] vector) {
-        static List<WorkloadItem> generate(int count) {
+        static List<WorkloadItem> generate(int count, int familyCount) {
+            List<WorkloadFamily> families = WorkloadFamily.generate(familyCount);
             List<WorkloadItem> items = new ArrayList<>();
             for (int index = 0; index < count; index++) {
+                WorkloadFamily family = families.get(index % families.size());
                 int bucket = index % 10;
                 if (bucket < 2) {
-                    items.add(new WorkloadItem(index, "exact-repeat", "store-a", "How long do I have to return unopened shoes?", CHAT_MODEL, EMBEDDING_MODEL, "returns-policy-2026-01", FullBenchmarkRunner.vector(0.10, 0.20, 0.30, 0.40)));
+                    items.add(family.item(index, "exact-repeat", family.exactPrompt(), family.baseVector(), family.sourceFingerprint()));
                 } else if (bucket < 5) {
-                    items.add(new WorkloadItem(index, "safe-paraphrase", "store-a", "Return window for unworn shoes request " + index, CHAT_MODEL, EMBEDDING_MODEL, "returns-policy-2026-01", FullBenchmarkRunner.vector(0.101, 0.199, 0.302, 0.398)));
+                    items.add(family.item(index, "safe-paraphrase", family.paraphrasePrompt(index), family.nearVector(), family.sourceFingerprint()));
                 } else if (bucket < 7) {
-                    items.add(new WorkloadItem(index, "near-miss", "store-a", "Can worn shoes be returned after ninety days request " + index, CHAT_MODEL, EMBEDDING_MODEL, "returns-policy-near-miss-" + index, FullBenchmarkRunner.vector(0.90, 0.10, 0.10, 0.05)));
+                    items.add(family.item(index, "near-miss", family.nearMissPrompt(index), family.farVector(), family.sourceFingerprint()));
                 } else if (bucket == 7) {
-                    items.add(new WorkloadItem(index, "tenant-or-model-mismatch", "store-b-" + index, "How long do I have to return unopened shoes?", CHAT_MODEL, EMBEDDING_MODEL, "returns-policy-2026-01", FullBenchmarkRunner.vector(0.10, 0.20, 0.30, 0.40)));
+                    items.add(new WorkloadItem(index, "tenant-or-model-mismatch", "store-b-" + family.id(), family.exactPrompt(), CHAT_MODEL, EMBEDDING_MODEL, family.sourceFingerprint(), family.baseVector()));
                 } else if (bucket == 8) {
-                    items.add(new WorkloadItem(index, "source-or-policy-change", "store-a", "How long do I have to return unopened shoes source " + index, CHAT_MODEL, EMBEDDING_MODEL, "returns-policy-2026-" + index, FullBenchmarkRunner.vector(0.10, 0.20, 0.30, 0.40)));
+                    items.add(family.item(index, "source-or-policy-change", family.sourceChangedPrompt(index), family.baseVector(), family.sourceFingerprint() + "-revision-" + index));
                 } else {
-                    items.add(new WorkloadItem(index, "cold-miss", "store-a", "New return policy question " + index, CHAT_MODEL, EMBEDDING_MODEL, "returns-policy-cold-" + index, FullBenchmarkRunner.vector(0.20, 0.30, 0.10, 0.70)));
+                    items.add(family.item(index, "cold-miss", family.coldPrompt(index), family.coldVector(), family.sourceFingerprint() + "-cold-" + index));
                 }
             }
             return items;
         }
 
-        static List<WorkloadItem> generateColdMissOnly(int count) {
+        static List<WorkloadItem> generateColdMissOnly(int count, int familyCount) {
+            List<WorkloadFamily> families = WorkloadFamily.generate(familyCount);
             List<WorkloadItem> items = new ArrayList<>();
             for (int index = 0; index < count; index++) {
-                items.add(new WorkloadItem(index, "cold-write-through", "store-a", "Cold write-through benchmark question " + index, CHAT_MODEL, EMBEDDING_MODEL, "returns-policy-write-through-" + index, FullBenchmarkRunner.vector(0.30, 0.40, 0.20, 0.10)));
+                WorkloadFamily family = families.get(index % families.size());
+                items.add(family.item(index, "cold-write-through", "Cold write-through benchmark question " + index + " for " + family.product(), family.coldVector(), family.sourceFingerprint() + "-write-through-" + index));
             }
             return items;
-        }
-
-        static WorkloadItem seedExact() {
-            return new WorkloadItem(-1, "prewarm-exact", "store-a", "How long do I have to return unopened shoes?", CHAT_MODEL, EMBEDDING_MODEL, "returns-policy-2026-01", FullBenchmarkRunner.vector(0.10, 0.20, 0.30, 0.40));
-        }
-
-        static WorkloadItem seedSemantic() {
-            return new WorkloadItem(-2, "prewarm-semantic", "store-a", "What is the return window for shoes that are still unworn?", CHAT_MODEL, EMBEDDING_MODEL, "returns-policy-2026-01", FullBenchmarkRunner.vector(0.10, 0.20, 0.30, 0.40));
         }
 
         SemanticCacheRequest request(String scenarioPrefix, double threshold) {
@@ -532,15 +584,93 @@ final class FullBenchmarkRunner {
         }
     }
 
-    private static final class BenchmarkProvider implements AnswerProvider {
-        private final int latencyMs;
+    private record WorkloadFamily(int id, String tenant, String product, String sourceFingerprint, double[] baseVector) {
+        static List<WorkloadFamily> generate(int count) {
+            List<WorkloadFamily> families = new ArrayList<>();
+            String[] products = {
+                "running shoes", "hiking boots", "dress shoes", "sandals", "winter coats",
+                "rain jackets", "backpacks", "laptop sleeves", "headphones", "fitness watches"
+            };
+            for (int id = 0; id < count; id++) {
+                double offset = (id % 25) / 1000.0;
+                families.add(new WorkloadFamily(
+                    id,
+                    "store-a",
+                    products[id % products.length] + " family " + id,
+                    "returns-policy-2026-family-" + id,
+                    FullBenchmarkRunner.vector(0.10 + offset, 0.20 + offset, 0.30 - offset, 0.40 - offset)));
+            }
+            return families;
+        }
 
-        private BenchmarkProvider(int latencyMs) {
-            this.latencyMs = latencyMs;
+        WorkloadItem seedItem() {
+            return item(-(id + 1), "prewarm-family", exactPrompt(), baseVector(), sourceFingerprint);
+        }
+
+        WorkloadItem item(int index, String type, String prompt, double[] vector, String source) {
+            return new WorkloadItem(index, type, tenant, prompt, CHAT_MODEL, EMBEDDING_MODEL, source, vector);
+        }
+
+        String exactPrompt() {
+            return "How long do I have to return unopened " + product + "?";
+        }
+
+        String paraphrasePrompt(int index) {
+            return "Return window for unused " + product + " request " + index;
+        }
+
+        String nearMissPrompt(int index) {
+            return "Can visibly worn " + product + " be returned after ninety days request " + index;
+        }
+
+        String sourceChangedPrompt(int index) {
+            return "How long do I have to return unopened " + product + " after source update " + index + "?";
+        }
+
+        String coldPrompt(int index) {
+            return "New return policy question " + index + " for " + product;
+        }
+
+        double[] nearVector() {
+            return FullBenchmarkRunner.vector(baseVector[0] + 0.001, baseVector[1] - 0.001, baseVector[2] + 0.002, baseVector[3] - 0.002);
+        }
+
+        double[] farVector() {
+            return FullBenchmarkRunner.vector(0.90, 0.10 + (id % 10) / 100.0, 0.10, 0.05);
+        }
+
+        double[] coldVector() {
+            return FullBenchmarkRunner.vector(0.20, 0.30, 0.10 + (id % 10) / 100.0, 0.70);
+        }
+    }
+
+    private interface BenchmarkAnswerProvider extends AnswerProvider {
+        static BenchmarkAnswerProvider create(BenchmarkConfig config) {
+            return switch (config.providerMode()) {
+                case "deterministic" -> new DeterministicBenchmarkProvider(config);
+                case "openai" -> new OpenAiResponsesBenchmarkProvider(config);
+                default -> throw new IllegalArgumentException("Unsupported BENCHMARK_PROVIDER_MODE=" + config.providerMode() + ". Use deterministic or openai.");
+            };
+        }
+
+        ProviderCallMetrics metrics(String scenarioName);
+
+        String displayName();
+    }
+
+    private static final class DeterministicBenchmarkProvider implements BenchmarkAnswerProvider {
+        private final int latencyMs;
+        private final BenchmarkConfig config;
+        private final Map<String, ProviderCallMetrics> metrics = new ConcurrentHashMap<>();
+
+        private DeterministicBenchmarkProvider(BenchmarkConfig config) {
+            this.latencyMs = config.providerLatencyMs();
+            this.config = config;
         }
 
         @Override
         public String generate(SemanticCacheRequest request) {
+            long started = System.nanoTime();
             if (latencyMs > 0) {
                 try {
                     Thread.sleep(latencyMs);
@@ -549,24 +679,156 @@ final class FullBenchmarkRunner {
                     throw new IllegalStateException("Provider simulation interrupted", interruptedException);
                 }
             }
+            String answer = answerFor(request);
+            TokenUsage tokenUsage = TokenUsage.estimate(request.prompt(), answer, config);
+            metrics.put(request.scenarioName(), new ProviderCallMetrics(
+                tokenUsage.promptTokens(),
+                tokenUsage.completionTokens(),
+                tokenUsage.totalTokens(),
+                tokenUsage.estimatedCostUsd(),
+                elapsedMillis(started),
+                "deterministic-estimate"));
+            return answer;
+        }
+
+        @Override
+        public ProviderCallMetrics metrics(String scenarioName) {
+            return metrics.get(scenarioName);
+        }
+
+        @Override
+        public String displayName() {
+            return "deterministic mock";
+        }
+
+        private String answerFor(SemanticCacheRequest request) {
             if (request.prompt().toLowerCase(Locale.ROOT).contains("worn")) {
-                return "Worn shoes follow the used-item policy and are not accepted after 90 days.";
+                return "Worn items follow the used-item policy and are not accepted after 90 days.";
             }
-            return "Unopened shoes can be returned within 30 days when the tenant return policy is returns-v1.";
+            return "Unopened items can be returned within 30 days when the tenant return policy is returns-v1.";
         }
     }
 
-    private record TokenUsage(int promptTokens, int completionTokens, int totalTokens, double estimatedCostUsd) {
-        static TokenUsage from(String prompt, String answer, boolean providerCalled) {
-            if (!providerCalled) {
-                return new TokenUsage(0, 0, 0, 0.0);
+    private static final class OpenAiResponsesBenchmarkProvider implements BenchmarkAnswerProvider {
+        private final BenchmarkConfig config;
+        private final HttpClient httpClient;
+        private final Map<String, ProviderCallMetrics> metrics = new ConcurrentHashMap<>();
+
+        private OpenAiResponsesBenchmarkProvider(BenchmarkConfig config) {
+            if (config.openAiApiKey().isBlank()) {
+                throw new IllegalArgumentException("OPENAI_API_KEY is required when BENCHMARK_PROVIDER_MODE=openai.");
             }
+            this.config = config;
+            this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .build();
+        }
+
+        @Override
+        public String generate(SemanticCacheRequest request) {
+            try {
+                long started = System.nanoTime();
+                ObjectNode body = JSON.createObjectNode();
+                body.put("model", config.openAiModel());
+                body.put("instructions", "You are a concise retail returns policy assistant. Answer in one sentence using this policy: unopened items can be returned within 30 days; visibly worn items are handled under the used-item policy and are not accepted after 90 days.");
+                body.put("input", request.prompt());
+                body.put("max_output_tokens", config.openAiMaxOutputTokens());
+
+                HttpRequest httpRequest = HttpRequest.newBuilder()
+                    .uri(URI.create(config.openAiBaseUrl()))
+                    .timeout(Duration.ofSeconds(120))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + config.openAiApiKey())
+                    .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body)))
+                    .build();
+
+                HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    throw new IllegalStateException("OpenAI Responses API returned HTTP " + response.statusCode() + ": " + response.body());
+                }
+
+                JsonNode root = JSON.readTree(response.body());
+                String answer = outputText(root);
+                JsonNode usage = root.path("usage");
+                int inputTokens = usage.path("input_tokens").asInt(0);
+                int outputTokens = usage.path("output_tokens").asInt(0);
+                int totalTokens = usage.path("total_tokens").asInt(inputTokens + outputTokens);
+                double cost = (inputTokens / 1_000_000.0 * config.inputCostPerMillion())
+                    + (outputTokens / 1_000_000.0 * config.outputCostPerMillion());
+                metrics.put(request.scenarioName(), new ProviderCallMetrics(
+                    inputTokens,
+                    outputTokens,
+                    totalTokens,
+                    cost,
+                    elapsedMillis(started),
+                    "openai-reported"));
+                return answer.isBlank() ? "(OpenAI response contained no output_text.)" : answer;
+            } catch (IOException ioException) {
+                throw new IllegalStateException("OpenAI benchmark request failed", ioException);
+            } catch (InterruptedException interruptedException) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("OpenAI benchmark request interrupted", interruptedException);
+            }
+        }
+
+        @Override
+        public ProviderCallMetrics metrics(String scenarioName) {
+            return metrics.get(scenarioName);
+        }
+
+        @Override
+        public String displayName() {
+            return "openai:" + config.openAiModel();
+        }
+
+        private static String outputText(JsonNode root) {
+            String direct = root.path("output_text").asText("");
+            if (!direct.isBlank()) {
+                return direct;
+            }
+            JsonNode output = root.path("output");
+            if (output.isArray()) {
+                for (JsonNode item : output) {
+                    JsonNode content = item.path("content");
+                    if (content.isArray()) {
+                        for (JsonNode contentItem : content) {
+                            if (contentItem.path("type").asText("").equals("output_text")) {
+                                String text = contentItem.path("text").asText("");
+                                if (!text.isBlank()) {
+                                    return text;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return "";
+        }
+    }
+
+    private record ProviderCallMetrics(int promptTokens, int completionTokens, int totalTokens, double estimatedCostUsd, long providerLatencyMs, String source) {
+    }
+
+    private record TokenUsage(int promptTokens, int completionTokens, int totalTokens, double estimatedCostUsd, String source) {
+        static TokenUsage from(String prompt, String answer, boolean providerCalled, ProviderCallMetrics metrics) {
+            if (!providerCalled) {
+                return new TokenUsage(0, 0, 0, 0.0, "cache-hit");
+            }
+            if (metrics != null) {
+                return new TokenUsage(metrics.promptTokens(), metrics.completionTokens(), metrics.totalTokens(), metrics.estimatedCostUsd(), metrics.source());
+            }
+            return estimate(prompt, answer, null);
+        }
+
+        static TokenUsage estimate(String prompt, String answer, BenchmarkConfig config) {
             int promptTokens = estimateTokens(prompt);
             int completionTokens = estimateTokens(answer);
             int total = promptTokens + completionTokens;
-            double cost = (promptTokens / 1_000_000.0 * INPUT_COST_PER_MILLION)
-                + (completionTokens / 1_000_000.0 * OUTPUT_COST_PER_MILLION);
-            return new TokenUsage(promptTokens, completionTokens, total, cost);
+            double inputCost = config == null ? INPUT_COST_PER_MILLION : config.inputCostPerMillion();
+            double outputCost = config == null ? OUTPUT_COST_PER_MILLION : config.outputCostPerMillion();
+            double cost = (promptTokens / 1_000_000.0 * inputCost)
+                + (completionTokens / 1_000_000.0 * outputCost);
+            return new TokenUsage(promptTokens, completionTokens, total, cost, "deterministic-estimate");
         }
 
         private static int estimateTokens(String text) {
@@ -587,7 +849,8 @@ final class FullBenchmarkRunner {
             int promptTokens,
             int completionTokens,
             int totalTokens,
-            double estimatedCostUsd) {
+            double estimatedCostUsd,
+            String tokenSource) {
         static BenchmarkEvent from(String mode, WorkloadItem item, SemanticCacheResponse response, TokenUsage tokenUsage) {
             return new BenchmarkEvent(
                 mode,
@@ -602,7 +865,8 @@ final class FullBenchmarkRunner {
                 tokenUsage.promptTokens(),
                 tokenUsage.completionTokens(),
                 tokenUsage.totalTokens(),
-                tokenUsage.estimatedCostUsd());
+                tokenUsage.estimatedCostUsd(),
+                tokenUsage.source());
         }
     }
 
