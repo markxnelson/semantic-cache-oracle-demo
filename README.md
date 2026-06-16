@@ -13,7 +13,7 @@ The default provider mode is deterministic `mock`. It exercises cache decisions 
 - Tenant, model, template, source, policy, status, and TTL predicates gate reuse.
 - The validation workload includes source-fingerprint mismatch and expired-entry cases.
 - Misses and near misses call the provider and write through the primary route.
-- Events record decision, reason, route, distance, threshold, provider calls, and latency.
+- Events record decision, reason, route, distance, threshold, provider calls, total latency, provider latency, and non-provider latency.
 - Reports are generated as CSV, JSON, and Markdown.
 
 ## Run
@@ -77,9 +77,13 @@ reports/generated/benchmark-full-summary.json
 reports/generated/benchmark-full-summary.md
 reports/generated/benchmark-full-wall-clock.png
 reports/generated/benchmark-full-requests-per-second.png
+reports/generated/benchmark-full-latency-components.png
+reports/generated/benchmark-full-cache-hit-lookup-latency.png
 reports/generated/benchmark-full-provider-calls.png
 reports/generated/benchmark-full-cost.png
 ```
+
+`benchmark-full-latency-components.png` separates average request time into LLM provider time and app/database/cache time. `benchmark-full-cache-hit-lookup-latency.png` excludes provider calls and compares only cache-hit lookup latency, which is the most direct chart for comparing the primary-read and True Cache-read paths.
 
 In OpenAI mode, token counts come from the OpenAI Responses API usage fields and cost values are calculated from those reported tokens and the configured per-million-token prices. Treat the cost as a benchmark estimate unless the configured prices match the model pricing you intend to use.
 

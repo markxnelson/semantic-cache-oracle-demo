@@ -100,6 +100,7 @@ final class FullBenchmarkRunner {
                 "none",
                 1,
                 elapsedMillis(requestStarted),
+                tokenUsage.providerLatencyMs(),
                 null,
                 THRESHOLD,
                 tokenUsage.promptTokens(),
@@ -292,8 +293,9 @@ final class FullBenchmarkRunner {
     }
 
     private static void writeEvents(Path output, List<BenchmarkEvent> events) throws IOException {
-        StringBuilder csv = new StringBuilder("mode,request_index,workload_type,decision,route,provider_calls,latency_ms,distance,threshold,prompt_tokens,completion_tokens,total_tokens,estimated_cost_usd,token_source\n");
+        StringBuilder csv = new StringBuilder("mode,request_index,workload_type,decision,route,provider_calls,latency_ms,provider_latency_ms,non_provider_latency_ms,distance,threshold,prompt_tokens,completion_tokens,total_tokens,estimated_cost_usd,token_source\n");
         for (BenchmarkEvent event : events) {
+            long nonProviderLatencyMs = Math.max(0, event.latencyMs() - event.providerLatencyMs());
             csv.append(event.mode()).append(',')
                 .append(event.requestIndex()).append(',')
                 .append(event.workloadType()).append(',')
@@ -301,6 +303,8 @@ final class FullBenchmarkRunner {
                 .append(event.route()).append(',')
                 .append(event.providerCalls()).append(',')
                 .append(event.latencyMs()).append(',')
+                .append(event.providerLatencyMs()).append(',')
+                .append(nonProviderLatencyMs).append(',')
                 .append(event.distance() == null ? "" : event.distance()).append(',')
                 .append(event.threshold()).append(',')
                 .append(event.promptTokens()).append(',')
@@ -410,6 +414,8 @@ final class FullBenchmarkRunner {
         md.append("- `reports/generated/benchmark-full-summary.json`\n");
         md.append("- `reports/generated/benchmark-full-summary.md`\n");
         md.append("- `reports/generated/benchmark-full-wall-clock.png`\n");
+        md.append("- `reports/generated/benchmark-full-latency-components.png`\n");
+        md.append("- `reports/generated/benchmark-full-cache-hit-lookup-latency.png`\n");
         md.append("- `reports/generated/benchmark-full-provider-calls.png`\n");
         md.append("- `reports/generated/benchmark-full-cost.png`\n");
         Files.writeString(output.resolve("benchmark-full-summary.md"), md.toString());
@@ -809,13 +815,13 @@ final class FullBenchmarkRunner {
     private record ProviderCallMetrics(int promptTokens, int completionTokens, int totalTokens, double estimatedCostUsd, long providerLatencyMs, String source) {
     }
 
-    private record TokenUsage(int promptTokens, int completionTokens, int totalTokens, double estimatedCostUsd, String source) {
+    private record TokenUsage(int promptTokens, int completionTokens, int totalTokens, double estimatedCostUsd, long providerLatencyMs, String source) {
         static TokenUsage from(String prompt, String answer, boolean providerCalled, ProviderCallMetrics metrics) {
             if (!providerCalled) {
-                return new TokenUsage(0, 0, 0, 0.0, "cache-hit");
+                return new TokenUsage(0, 0, 0, 0.0, 0, "cache-hit");
             }
             if (metrics != null) {
-                return new TokenUsage(metrics.promptTokens(), metrics.completionTokens(), metrics.totalTokens(), metrics.estimatedCostUsd(), metrics.source());
+                return new TokenUsage(metrics.promptTokens(), metrics.completionTokens(), metrics.totalTokens(), metrics.estimatedCostUsd(), metrics.providerLatencyMs(), metrics.source());
             }
             return estimate(prompt, answer, null);
         }
@@ -828,7 +834,7 @@ final class FullBenchmarkRunner {
             double outputCost = config == null ? OUTPUT_COST_PER_MILLION : config.outputCostPerMillion();
             double cost = (promptTokens / 1_000_000.0 * inputCost)
                 + (completionTokens / 1_000_000.0 * outputCost);
-            return new TokenUsage(promptTokens, completionTokens, total, cost, "deterministic-estimate");
+            return new TokenUsage(promptTokens, completionTokens, total, cost, 0, "deterministic-estimate");
         }
 
         private static int estimateTokens(String text) {
@@ -844,6 +850,7 @@ final class FullBenchmarkRunner {
             String route,
             int providerCalls,
             long latencyMs,
+            long providerLatencyMs,
             Double distance,
             double threshold,
             int promptTokens,
@@ -860,6 +867,7 @@ final class FullBenchmarkRunner {
                 response.routeName(),
                 response.providerCalls(),
                 response.latencyMs(),
+                tokenUsage.providerLatencyMs(),
                 response.distance(),
                 response.threshold(),
                 tokenUsage.promptTokens(),
