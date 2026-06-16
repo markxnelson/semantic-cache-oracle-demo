@@ -36,6 +36,11 @@ public class SemanticCacheDemoApplication implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
+        if (env("SEM_CACHE_RUN_MODE", "validation").equals("benchmark-full")) {
+            FullBenchmarkRunner.run();
+            return;
+        }
+
         String user = env("APP_USER", "SEMCACHE_APP");
         String password = env("APP_PASSWORD", "SemCache_26ai_Demo");
         DataSource primary = oracleDataSource(env("PRIMARY_JDBC_URL", "jdbc:oracle:thin:@//localhost:1521/FREEPDB1"), user, password);

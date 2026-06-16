@@ -14,6 +14,8 @@ import javax.sql.DataSource;
 public class SemanticCacheService {
     private final DataSource primaryDataSource;
     private final DataSource readDataSource;
+    private final Connection primaryConnection;
+    private final Connection readConnection;
     private final String readRouteName;
     private final AnswerProvider provider;
 
@@ -24,6 +26,21 @@ public class SemanticCacheService {
             AnswerProvider provider) {
         this.primaryDataSource = primaryDataSource;
         this.readDataSource = readDataSource;
+        this.primaryConnection = null;
+        this.readConnection = null;
+        this.readRouteName = readRouteName;
+        this.provider = provider;
+    }
+
+    public SemanticCacheService(
+            Connection primaryConnection,
+            Connection readConnection,
+            String readRouteName,
+            AnswerProvider provider) {
+        this.primaryDataSource = null;
+        this.readDataSource = null;
+        this.primaryConnection = primaryConnection;
+        this.readConnection = readConnection;
         this.readRouteName = readRouteName;
         this.provider = provider;
     }
@@ -32,8 +49,9 @@ public class SemanticCacheService {
         long started = System.nanoTime();
         String promptHash = promptHash(request.prompt());
 
-        try (Connection readConnection = readDataSource.getConnection()) {
-            Candidate exact = findExact(readConnection, request, promptHash);
+        Connection activeReadConnection = readConnection();
+        try {
+            Candidate exact = findExact(activeReadConnection, request, promptHash);
             if (exact != null) {
                 SemanticCacheResponse response = new SemanticCacheResponse(
                     request.scenarioName(),
@@ -49,7 +67,7 @@ public class SemanticCacheService {
                 return response;
             }
 
-            Candidate semantic = findSemantic(readConnection, request);
+            Candidate semantic = findSemantic(activeReadConnection, request);
             if (semantic != null && semantic.distance() <= request.threshold()) {
                 SemanticCacheResponse response = new SemanticCacheResponse(
                     request.scenarioName(),
@@ -91,6 +109,8 @@ public class SemanticCacheService {
                 recordEvent(response);
                 return response;
             }
+        } finally {
+            closeIfOwned(activeReadConnection, readConnection);
         }
 
         String answer = provider.generate(request);
@@ -110,7 +130,8 @@ public class SemanticCacheService {
     }
 
     public void reset() throws SQLException {
-        try (Connection connection = primaryDataSource.getConnection()) {
+        Connection connection = primaryConnection();
+        try {
             connection.setAutoCommit(false);
             try (PreparedStatement deleteEvents = connection.prepareStatement("DELETE FROM sem_cache_event WHERE 1 = 1");
                  PreparedStatement deleteEntries = connection.prepareStatement("DELETE FROM sem_cache_entry WHERE 1 = 1")) {
@@ -118,6 +139,8 @@ public class SemanticCacheService {
                 deleteEntries.executeUpdate();
             }
             connection.commit();
+        } finally {
+            closeIfOwned(connection, primaryConnection);
         }
     }
 
@@ -203,7 +226,8 @@ public class SemanticCacheService {
               ?, ?, 'ACTIVE', ?
             )
             """;
-        try (Connection connection = primaryDataSource.getConnection()) {
+        Connection connection = primaryConnection();
+        try {
             connection.setAutoCommit(false);
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
                 statement.setString(1, request.tenantId());
@@ -221,6 +245,8 @@ public class SemanticCacheService {
                 statement.executeUpdate();
             }
             connection.commit();
+        } finally {
+            closeIfOwned(connection, primaryConnection);
         }
     }
 
@@ -230,8 +256,8 @@ public class SemanticCacheService {
               scenario_name, route_name, decision, reason, distance, threshold, provider_calls, latency_ms
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """;
-        try (Connection connection = primaryDataSource.getConnection();
-             PreparedStatement statement = connection.prepareStatement(sql)) {
+        Connection connection = primaryConnection();
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, response.scenarioName());
             statement.setString(2, response.routeName());
             statement.setString(3, response.decision());
@@ -245,6 +271,22 @@ public class SemanticCacheService {
             statement.setInt(7, response.providerCalls());
             statement.setLong(8, response.latencyMs());
             statement.executeUpdate();
+        } finally {
+            closeIfOwned(connection, primaryConnection);
+        }
+    }
+
+    private Connection primaryConnection() throws SQLException {
+        return primaryConnection == null ? primaryDataSource.getConnection() : primaryConnection;
+    }
+
+    private Connection readConnection() throws SQLException {
+        return readConnection == null ? readDataSource.getConnection() : readConnection;
+    }
+
+    private static void closeIfOwned(Connection connection, Connection sharedConnection) throws SQLException {
+        if (sharedConnection == null) {
+            connection.close();
         }
     }
 

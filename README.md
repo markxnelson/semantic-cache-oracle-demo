@@ -39,6 +39,49 @@ reports/generated/benchmark-lite-events.csv
 reports/generated/benchmark-lite-summary.md
 ```
 
+## Full Benchmark
+
+`run-benchmark-lite.sh` is intentionally small. It reuses the eight validation scenarios to prove measurement wiring.
+
+For a larger benchmark that compares cache modes, run:
+
+```bash
+BENCHMARK_REQUESTS=1000 \
+BENCHMARK_CONCURRENCY=1 \
+BENCHMARK_PROVIDER_LATENCY_MS=10 \
+BENCHMARK_PREWARM_PAUSE_MS=1500 \
+./scripts/run-benchmark-full.sh
+```
+
+The full benchmark uses deterministic provider mode by default. It compares:
+
+- `no-cache`
+- `exact-cache`
+- `semantic-cache-primary`
+- `semantic-cache-true-cache`
+- `semantic-cache-write-through`
+
+It writes CSV, JSON, Markdown, and matplotlib PNG charts under `reports/generated/`:
+
+```text
+reports/generated/benchmark-full-config.json
+reports/generated/benchmark-full-events.csv
+reports/generated/benchmark-full-latency.csv
+reports/generated/benchmark-full-cost.csv
+reports/generated/benchmark-full-summary.json
+reports/generated/benchmark-full-summary.md
+reports/generated/benchmark-full-wall-clock.png
+reports/generated/benchmark-full-requests-per-second.png
+reports/generated/benchmark-full-provider-calls.png
+reports/generated/benchmark-full-cost.png
+```
+
+The estimated cost values use deterministic token estimates and configurable example prices in the demo code. Treat them as a repeatable benchmark signal, not as a provider invoice.
+
+The default concurrency is `1` because the local Oracle True Cache Free container can reject bursts of concurrent listener connections on small developer machines. Raise `BENCHMARK_CONCURRENCY` deliberately when you want to study concurrency on a machine and container configuration sized for it.
+
+The prewarm pause gives Oracle True Cache a short window to see seeded cache rows before measured read-route requests begin. Keep it visible in benchmark reports because it is part of the test method.
+
 ## Routes
 
 The app uses two explicit JDBC URLs:
