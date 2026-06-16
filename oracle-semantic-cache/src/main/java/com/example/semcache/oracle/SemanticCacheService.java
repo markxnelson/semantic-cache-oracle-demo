@@ -84,28 +84,18 @@ public class SemanticCacheService {
             }
 
             if (semantic != null) {
-                SemanticCacheResponse nearMiss = new SemanticCacheResponse(
+                String answer = provider.generate(request);
+                insertEntry(request, promptHash, answer);
+                SemanticCacheResponse response = new SemanticCacheResponse(
                     request.scenarioName(),
                     "near-miss",
                     "closest vector candidate failed threshold policy",
-                    "",
+                    answer,
                     readRouteName,
                     semantic.distance(),
                     request.threshold(),
                     1,
                     elapsedMillis(started));
-                String answer = provider.generate(request);
-                insertEntry(request, promptHash, answer);
-                SemanticCacheResponse response = new SemanticCacheResponse(
-                    nearMiss.scenarioName(),
-                    nearMiss.decision(),
-                    nearMiss.reason(),
-                    answer,
-                    nearMiss.routeName(),
-                    nearMiss.distance(),
-                    nearMiss.threshold(),
-                    nearMiss.providerCalls(),
-                    nearMiss.latencyMs());
                 recordEvent(response);
                 return response;
             }
