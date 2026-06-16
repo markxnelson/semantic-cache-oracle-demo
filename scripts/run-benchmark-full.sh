@@ -53,7 +53,7 @@ cost_path = generated / "benchmark-full-cost.csv"
 latency_rows = list(csv.DictReader(latency_path.open()))
 cost_rows = list(csv.DictReader(cost_path.open()))
 
-def save_bar(path, title, ylabel, labels, values, color):
+def save_bar(path, title, ylabel, labels, values, color, value_format=None):
     fig, ax = plt.subplots(figsize=(10, 5.5))
     ax.bar(labels, values, color=color)
     ax.set_title(title)
@@ -61,7 +61,8 @@ def save_bar(path, title, ylabel, labels, values, color):
     ax.tick_params(axis="x", rotation=25)
     ax.grid(axis="y", alpha=0.25)
     for index, value in enumerate(values):
-        ax.text(index, value, f"{value:.2f}" if isinstance(value, float) else str(value), ha="center", va="bottom", fontsize=8)
+        label = value_format(value) if value_format else str(value)
+        ax.text(index, value, label, ha="center", va="bottom", fontsize=8)
     fig.tight_layout()
     fig.savefig(generated / path, dpi=160)
     plt.close(fig)
@@ -74,6 +75,7 @@ save_bar(
     modes,
     [int(row["wall_clock_ms"]) for row in latency_rows],
     "#4e79a7",
+    lambda value: f"{value:.0f}",
 )
 save_bar(
     "benchmark-full-requests-per-second.png",
@@ -82,6 +84,7 @@ save_bar(
     modes,
     [float(row["requests_per_second"]) for row in latency_rows],
     "#59a14f",
+    lambda value: f"{value:.2f}",
 )
 
 cost_by_mode = {row["mode"]: row for row in cost_rows}
@@ -92,6 +95,7 @@ save_bar(
     modes,
     [int(cost_by_mode[mode]["provider_calls_made"]) for mode in modes],
     "#f28e2b",
+    lambda value: f"{value:.0f}",
 )
 save_bar(
     "benchmark-full-cost.png",
@@ -100,6 +104,7 @@ save_bar(
     modes,
     [float(cost_by_mode[mode]["estimated_cost_usd"]) for mode in modes],
     "#e15759",
+    lambda value: f"${value:.4f}",
 )
 
 print("Generated charts:")
